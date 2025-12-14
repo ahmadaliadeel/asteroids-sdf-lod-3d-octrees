@@ -540,7 +540,7 @@ fn sample_sdf(p: vec3f) -> f32 {
 
 // Calculate normal from SDF gradient
 fn calc_normal(p: vec3f) -> vec3f {
-    let eps = 0.005;
+    let eps = 0.002;
     let n = vec3f(
         sample_sdf(p + vec3f(eps, 0.0, 0.0)) - sample_sdf(p - vec3f(eps, 0.0, 0.0)),
         sample_sdf(p + vec3f(0.0, eps, 0.0)) - sample_sdf(p - vec3f(0.0, eps, 0.0)),
@@ -549,11 +549,151 @@ fn calc_normal(p: vec3f) -> vec3f {
     return normalize(n);
 }
 
+// Soft shadows with penumbra
+fn soft_shadow(ro: vec3f, rd: vec3f, mint: f32, maxt: f32, k: f32) -> f32 {
+    var res = 1.0;
+    var t = mint;
+    var ph = 1e20;
+    
+    for (var i = 0; i < 64; i++) {
+        let h = sample_sdf(ro + rd * t);
+        if (h < 0.0001) {
+            return 0.0;
+        }
+        let y = h * h / (2.0 * ph);
+        let d = sqrt(h * h - y * y);
+        res = min(res, k * d / max(0.0, t - y));
+        ph = h;
+        t += h * 0.5;
+        if (t > maxt) {
+            break;
+        }
+    }
+    return clamp(res, 0.0, 1.0);
+}
+
+// Ambient occlusion
+fn calc_ao(p: vec3f, n: vec3f) -> f32 {
+    var occ = 0.0;
+    var sca = 1.0;
+    
+    for (var i = 0; i < 5; i++) {
+        let h = 0.01 + 0.12 * f32(i) / 4.0;
+        let d = sample_sdf(p + h * n);
+        occ += (h - d) * sca;
+        sca *= 0.95;
+    }
+    return clamp(1.0 - 3.0 * occ, 0.0, 1.0);
+}
+
+// Sky color for environment lighting
+fn sky_color(rd: vec3f) -> vec3f {
+    // Gradient sky with horizon glow
+    let sun_dir = normalize(vec3f(0.5, 0.4, 0.6));
+    
+    // Base sky gradient
+    let sky_blue = vec3f(0.3, 0.5, 0.8);
+    let horizon = vec3f(0.7, 0.75, 0.8);
+    let ground = vec3f(0.1, 0.1, 0.12);
+    
+    var col = vec3f(0.0);
+    if (rd.y > 0.0) {
+        col = mix(horizon, sky_blue, pow(rd.y, 0.5));
+    } else {
+        col = mix(horizon, ground, pow(-rd.y, 0.5));
+    }
+    
+    // Sun glow
+    let sun = max(dot(rd, sun_dir), 0.0);
+    col += vec3f(1.0, 0.8, 0.5) * pow(sun, 32.0) * 0.5;
+    col += vec3f(1.0, 0.9, 0.7) * pow(sun, 8.0) * 0.2;
+    
+    return col;
+}
+
+// Get material color based on octree depth
+fn get_material_color(p: vec3f, normal: vec3f) -> vec3f {
+    let node_idx = find_leaf_node(p);
+    var base_color = vec3f(0.6, 0.55, 0.5);  // Rocky/asteroid color
+    
+    if (node_idx >= 0) {
+        let depth = f32(nodes[node_idx].depth) / f32(MAX_DEPTH);
+        // Subtle depth visualization blended with material
+        base_color = mix(base_color, base_color * vec3f(0.9, 0.95, 1.1), depth * 0.3);
+    }
+    
+    // Add some variation based on position
+    let variation = fbm(p * 8.0) * 0.15;
+    base_color += vec3f(variation, variation * 0.8, variation * 0.6);
+    
+    return base_color;
+}
+
+// Full shading calculation
+fn shade(p: vec3f, normal: vec3f, rd: vec3f) -> vec3f {
+    let view_dir = -rd;
+    
+    // Material properties
+    let albedo = get_material_color(p, normal);
+    let roughness = 0.7;
+    let metallic = 0.0;
+    
+    // Main directional light (sun)
+    let light_dir = normalize(vec3f(0.5, 0.6, 0.4));
+    let light_color = vec3f(1.4, 1.2, 1.0);
+    
+    // Ambient occlusion
+    let ao = calc_ao(p, normal);
+    
+    // Soft shadows
+    let shadow = soft_shadow(p + normal * 0.01, light_dir, 0.02, 3.0, 16.0);
+    
+    // Diffuse (Lambert)
+    let n_dot_l = max(dot(normal, light_dir), 0.0);
+    let diffuse = albedo * n_dot_l * light_color * shadow;
+    
+    // Specular (Blinn-Phong)
+    let half_vec = normalize(light_dir + view_dir);
+    let n_dot_h = max(dot(normal, half_vec), 0.0);
+    let spec_power = mix(8.0, 128.0, 1.0 - roughness);
+    let specular = pow(n_dot_h, spec_power) * shadow * (1.0 - roughness) * 0.5;
+    
+    // Environment/Sky lighting (GI approximation)
+    let sky_up = sky_color(normal);
+    let sky_reflect = sky_color(reflect(rd, normal));
+    let env_diffuse = albedo * sky_up * 0.15;
+    let env_specular = sky_reflect * (1.0 - roughness) * 0.1;
+    
+    // Fresnel for rim lighting and reflections
+    let fresnel = pow(1.0 - max(dot(normal, view_dir), 0.0), 5.0);
+    let rim = fresnel * sky_color(reflect(rd, normal)) * 0.3;
+    
+    // Subsurface scattering approximation (for soft material look)
+    let sss_light = max(dot(view_dir, -light_dir + normal * 0.5), 0.0);
+    let sss = pow(sss_light, 3.0) * vec3f(0.8, 0.4, 0.3) * 0.15 * shadow;
+    
+    // Ground bounce light (fake GI from below)
+    let ground_bounce = max(-normal.y, 0.0) * vec3f(0.1, 0.08, 0.06) * albedo * 0.5;
+    
+    // Combine all lighting
+    var color = diffuse + vec3f(specular) + env_diffuse + env_specular + rim + sss + ground_bounce;
+    
+    // Apply AO
+    color *= ao;
+    
+    // Add slight atmospheric haze based on depth
+    let dist = length(p - uniforms.camera_pos);
+    let fog = 1.0 - exp(-dist * 0.15);
+    color = mix(color, sky_color(rd) * 0.5, fog * 0.3);
+    
+    return color;
+}
+
 // Ray march through the octree volume
 fn ray_march(ro: vec3f, rd: vec3f) -> vec4f {
     let MAX_STEPS = 200;
-    let MAX_DIST = 10.0;
-    let SURF_DIST = 0.0005;
+    let MAX_DIST = 15.0;
+    let SURF_DIST = 0.0003;
     
     var t = 0.0;
     
@@ -562,55 +702,22 @@ fn ray_march(ro: vec3f, rd: vec3f) -> vec4f {
         let d = sample_sdf(p);
         
         if (d < SURF_DIST) {
-            // Hit surface - calculate shading
+            // Hit surface - calculate full shading
             let normal = calc_normal(p);
-            
-            // Light direction (rotating with time)
-            let light_dir = normalize(vec3f(
-                sin(uniforms.time * 0.5),
-                0.8,
-                cos(uniforms.time * 0.5)
-            ));
-            
-            // Diffuse lighting
-            let diff = max(dot(normal, light_dir), 0.0);
-            
-            // Ambient occlusion approximation
-            let ao = 1.0 - f32(i) / f32(MAX_STEPS) * 0.5;
-            
-            // Fresnel-like rim lighting
-            let view_dir = -rd;
-            let rim = pow(1.0 - max(dot(normal, view_dir), 0.0), 3.0);
-            
-            // Color based on octree depth (for visualization)
-            let node_idx = find_leaf_node(p);
-            var depth_color = vec3f(0.2, 0.5, 0.9);
-            if (node_idx >= 0) {
-                let depth = f32(nodes[node_idx].depth) / f32(MAX_DEPTH);
-                depth_color = mix(vec3f(0.2, 0.5, 0.9), vec3f(0.9, 0.3, 0.2), depth);
-            }
-            
-            // Add normal-based color variation
-            let base_color = depth_color + normal * 0.15;
-            
-            // Final color
-            let color = base_color * (diff * 0.7 + 0.3) * ao + vec3f(0.8, 0.6, 0.4) * rim * 0.3;
-            
+            let color = shade(p, normal, rd);
             return vec4f(color, 1.0);
         }
         
-        // Adaptive step size based on distance
-        t += max(d * 0.9, 0.001);
+        // Adaptive step size
+        t += max(d * 0.65, 0.001);
         
         if (t > MAX_DIST) {
             break;
         }
     }
     
-    // Background gradient
-    let bg_top = vec3f(0.05, 0.05, 0.15);
-    let bg_bottom = vec3f(0.02, 0.02, 0.05);
-    return vec4f(mix(bg_bottom, bg_top, rd.y * 0.5 + 0.5), 1.0);
+    // Sky background
+    return vec4f(sky_color(rd), 1.0);
 }
 
 @fragment
@@ -730,7 +837,7 @@ def main():
     # Create the render canvas
     canvas = RenderCanvas(
         title="SDF Ray Marching - Octree LOD",
-        size=(800, 600),
+        size=(1024, 768),
         max_fps=60,
     )
     
@@ -809,7 +916,7 @@ def main():
     camera_yaw = [-2.3]  # Rotation around Y axis (radians)
     camera_pitch = [-0.3]  # Rotation around X axis (radians)
     mouse_sensitivity = [0.003]
-    move_speed = [0.5]
+    move_speed = [0.1]
     mouse_captured = [False]
     last_mouse_pos = [0.0, 0.0]
     
