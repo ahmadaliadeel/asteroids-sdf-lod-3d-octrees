@@ -586,29 +586,64 @@ fn calc_ao(p: vec3f, n: vec3f) -> f32 {
     return clamp(1.0 - 3.0 * occ, 0.0, 1.0);
 }
 
-// Sky color for environment lighting
+// Spherical sky environment
 fn sky_color(rd: vec3f) -> vec3f {
-    // Gradient sky with horizon glow
+    // Sun position
     let sun_dir = normalize(vec3f(0.5, 0.4, 0.6));
     
-    // Base sky gradient
-    let sky_blue = vec3f(0.3, 0.5, 0.8);
-    let horizon = vec3f(0.7, 0.75, 0.8);
-    let ground = vec3f(0.1, 0.1, 0.12);
+    // Spherical gradient based on direction
+    // Use abs(y) for symmetry, creating a full sphere environment
+    let elevation = rd.y;
+    let abs_elevation = abs(elevation);
     
+    // Deep space / nebula colors for a cosmic feel
+    let zenith_color = vec3f(0.02, 0.05, 0.15);      // Deep blue/purple at poles
+    let mid_color = vec3f(0.15, 0.12, 0.25);         // Purple-ish mid regions  
+    let equator_color = vec3f(0.25, 0.18, 0.12);     // Warm brown/orange at equator
+    
+    // Blend based on elevation (full sphere)
     var col = vec3f(0.0);
-    if (rd.y > 0.0) {
-        col = mix(horizon, sky_blue, pow(rd.y, 0.5));
+    if (abs_elevation > 0.5) {
+        // Upper/lower regions toward poles
+        let t = (abs_elevation - 0.5) * 2.0;
+        col = mix(mid_color, zenith_color, t);
     } else {
-        col = mix(horizon, ground, pow(-rd.y, 0.5));
+        // Equatorial region
+        let t = abs_elevation * 2.0;
+        col = mix(equator_color, mid_color, t);
     }
     
-    // Sun glow
-    let sun = max(dot(rd, sun_dir), 0.0);
-    col += vec3f(1.0, 0.8, 0.5) * pow(sun, 32.0) * 0.5;
-    col += vec3f(1.0, 0.9, 0.7) * pow(sun, 8.0) * 0.2;
+    // Add subtle color variation based on horizontal angle
+    let angle = atan2(rd.z, rd.x);
+    let angle_var = sin(angle * 3.0) * 0.05 + sin(angle * 7.0) * 0.02;
+    col += vec3f(angle_var * 0.5, angle_var * 0.3, angle_var);
     
-    return col;
+    // Stars (noise-based)
+    let star_noise = hash3(floor(rd * 200.0));
+    if (star_noise > 0.985) {
+        let star_brightness = pow((star_noise - 0.985) / 0.015, 2.0);
+        col += vec3f(star_brightness) * 0.8;
+    }
+    
+    // Sun glow (works from any direction)
+    let sun = max(dot(rd, sun_dir), 0.0);
+    col += vec3f(1.0, 0.9, 0.7) * pow(sun, 64.0) * 2.0;   // Bright sun core
+    col += vec3f(1.0, 0.7, 0.4) * pow(sun, 8.0) * 0.4;    // Sun glow
+    col += vec3f(1.0, 0.5, 0.2) * pow(sun, 2.0) * 0.1;    // Wide sun haze
+    
+    // Secondary light source (opposite side, dimmer)
+    let anti_sun_dir = normalize(vec3f(-0.6, -0.3, -0.5));
+    let anti_sun = max(dot(rd, anti_sun_dir), 0.0);
+    col += vec3f(0.3, 0.4, 0.8) * pow(anti_sun, 16.0) * 0.3;  // Cool blue secondary
+    
+    // Nebula-like glow regions
+    let nebula1 = max(dot(rd, normalize(vec3f(0.8, 0.2, -0.5))), 0.0);
+    col += vec3f(0.4, 0.1, 0.3) * pow(nebula1, 4.0) * 0.2;
+    
+    let nebula2 = max(dot(rd, normalize(vec3f(-0.3, -0.6, 0.7))), 0.0);
+    col += vec3f(0.1, 0.3, 0.4) * pow(nebula2, 3.0) * 0.15;
+    
+    return max(col, vec3f(0.0));
 }
 
 // Get material color based on octree depth
