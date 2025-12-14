@@ -73,7 +73,7 @@ def sample_sdf_world_vectorized(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> 
     Vectorized version of sample_sdf_world for fast volume generation.
     x, y, z are 3D arrays of coordinates.
     """
-    sphere_radius = 0.5
+    sphere_radius = 0.4
     dist = np.sqrt(x**2 + y**2 + z**2) - sphere_radius
     
     # Add sine displacement for visual interest
@@ -243,8 +243,10 @@ struct Uniforms {
     num_nodes: u32,
     max_lod_depth: u32,
     volumes_per_side: u32,
-    _pad2: u32,
-    _pad3: u32,
+    lod_distance_scale: f32,  // Controls how aggressively LOD drops with distance
+    use_distance_lod: u32,    // 0 = fixed LOD, 1 = distance-based LOD
+    camera_pos: vec3f,
+    _pad: f32,
 }
 
 struct OctreeNode {
@@ -294,15 +296,38 @@ fn point_in_node(p: vec3f, node_idx: u32) -> bool {
     return all(d <= vec3f(node.half_size));
 }
 
-// Find the leaf node containing point p, respecting LOD limit
+// Calculate LOD depth based on distance from camera
+fn get_distance_lod(p: vec3f) -> u32 {
+    if (uniforms.use_distance_lod == 0u) {
+        return uniforms.max_lod_depth;
+    }
+    
+    let dist = length(p - uniforms.camera_pos);
+    
+    // Scale: closer = higher LOD, farther = lower LOD
+    // LOD = max_depth - floor(dist * scale)
+    // At dist=0, full detail. As dist increases, LOD decreases.
+    let lod_reduction = u32(floor(dist * uniforms.lod_distance_scale));
+    
+    if (lod_reduction >= uniforms.max_lod_depth) {
+        return 0u;  // Minimum detail
+    }
+    
+    return uniforms.max_lod_depth - lod_reduction;
+}
+
+// Find the leaf node containing point p, respecting distance-based LOD
 fn find_leaf_node(p: vec3f) -> i32 {
     var current: i32 = 0;
+    
+    // Get LOD depth based on distance
+    let target_depth = get_distance_lod(p);
     
     for (var depth = 0u; depth < MAX_DEPTH + 1u; depth++) {
         let node = nodes[current];
         
-        // Check if this is a leaf OR we've reached LOD limit
-        if (node.children_start < 0 || node.depth >= uniforms.max_lod_depth) {
+        // Check if this is a leaf OR we've reached LOD limit for this distance
+        if (node.children_start < 0 || node.depth >= target_depth) {
             return current;
         }
         
@@ -634,9 +659,10 @@ def main():
     )
     device.queue.write_buffer(node_buffer, 0, node_buffer_data.tobytes())
     
-    # Create uniform buffer (8 floats = 32 bytes for alignment)
-    # resolution(2) + time(1) + num_nodes(1) + max_lod_depth(1) + pad(3)
-    uniform_data = np.zeros(8, dtype=np.float32)
+    # Create uniform buffer (16 floats = 64 bytes for alignment)
+    # resolution(2) + time(1) + num_nodes(1) + max_lod_depth(1) + volumes_per_side(1) + 
+    # lod_distance_scale(1) + use_distance_lod(1) + camera_pos(3) + pad(1) = 12, padded to 16
+    uniform_data = np.zeros(16, dtype=np.float32)
     uniform_buffer = device.create_buffer(
         size=uniform_data.nbytes,
         usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
@@ -644,6 +670,8 @@ def main():
     
     # LOD control state
     current_lod = [MAX_DEPTH]  # Use list for closure mutation
+    use_distance_lod = [1]  # 1 = enabled, 0 = fixed LOD
+    lod_distance_scale = [3.0]  # How aggressively LOD drops with distance
     
     # Create shader module
     shader_module = device.create_shader_module(code=SHADER_CODE)
@@ -722,28 +750,40 @@ def main():
     
     def key_callback(window, key, scancode, action, mods):
         if action == glfw.PRESS or action == glfw.REPEAT:
-            # Number keys 1-6 set LOD level (0-5 depth limit)
+            # Number keys 1-6 set max LOD level (0-5 depth limit)
             if key == glfw.KEY_1:
                 current_lod[0] = 0
-                print(f"LOD: 0 (root only)")
+                print(f"Max LOD: 0 (root only)")
             elif key == glfw.KEY_2:
                 current_lod[0] = 1
-                print(f"LOD: 1")
+                print(f"Max LOD: 1")
             elif key == glfw.KEY_3:
                 current_lod[0] = 2
-                print(f"LOD: 2")
+                print(f"Max LOD: 2")
             elif key == glfw.KEY_4:
                 current_lod[0] = 3
-                print(f"LOD: 3")
+                print(f"Max LOD: 3")
             elif key == glfw.KEY_5:
                 current_lod[0] = 4
-                print(f"LOD: 4")
+                print(f"Max LOD: 4")
             elif key == glfw.KEY_6:
                 current_lod[0] = 5
-                print(f"LOD: 5 (max detail)")
+                print(f"Max LOD: 5 (max detail)")
             elif key == glfw.KEY_0:
                 current_lod[0] = MAX_DEPTH
-                print(f"LOD: {MAX_DEPTH} (full detail)")
+                print(f"Max LOD: {MAX_DEPTH} (full detail)")
+            # D key toggles distance-based LOD
+            elif key == glfw.KEY_D:
+                use_distance_lod[0] = 1 - use_distance_lod[0]
+                mode = "Distance-based" if use_distance_lod[0] else "Fixed"
+                print(f"LOD Mode: {mode}")
+            # +/- keys adjust distance scale
+            elif key == glfw.KEY_EQUAL or key == glfw.KEY_KP_ADD:
+                lod_distance_scale[0] = min(10.0, lod_distance_scale[0] + 0.5)
+                print(f"LOD Distance Scale: {lod_distance_scale[0]:.1f}")
+            elif key == glfw.KEY_MINUS or key == glfw.KEY_KP_SUBTRACT:
+                lod_distance_scale[0] = max(0.5, lod_distance_scale[0] - 0.5)
+                print(f"LOD Distance Scale: {lod_distance_scale[0]:.1f}")
     
     glfw.set_key_callback(glfw_window, key_callback)
     
@@ -757,16 +797,30 @@ def main():
             canvas.request_draw(draw_frame)
             return
         
+        # Calculate camera position (same as shader)
+        angle = current_time * 0.3
+        cam_dist = 1.1
+        cam_x = np.sin(angle) * cam_dist
+        cam_y = np.sin(current_time * 0.2) * 0.3 + 0.3
+        cam_z = np.cos(angle) * cam_dist
+        
         uniform_data[0] = float(width)
         uniform_data[1] = float(height)
         uniform_data[2] = current_time
-        # Store integers as uint32
+        # Store integers as uint32 for slots 3-7
         int_view = uniform_data[3:8].view(np.uint32)
-        int_view[0] = len(nodes)
-        int_view[1] = current_lod[0]
-        int_view[2] = volumes_per_side
-        int_view[3] = 0  # padding
-        int_view[4] = 0  # padding
+        int_view[0] = len(nodes)          # num_nodes
+        int_view[1] = current_lod[0]      # max_lod_depth
+        int_view[2] = volumes_per_side    # volumes_per_side
+        # Slot 6-7: lod_distance_scale (float) and use_distance_lod (uint)
+        uniform_data[6] = lod_distance_scale[0]
+        int_view2 = uniform_data[7:8].view(np.uint32)
+        int_view2[0] = use_distance_lod[0]
+        # Camera position
+        uniform_data[8] = cam_x
+        uniform_data[9] = cam_y
+        uniform_data[10] = cam_z
+        uniform_data[11] = 0.0  # padding
         
         device.queue.write_buffer(uniform_buffer, 0, uniform_data.tobytes())
         
@@ -805,10 +859,13 @@ def main():
     
     print("Starting render loop...")
     print("Controls:")
-    print(f"  1-6: Set LOD level (1=coarse, 6=finest, max={MAX_DEPTH})")
+    print(f"  1-6: Set max LOD level (1=coarse, 6=finest, max={MAX_DEPTH})")
     print("  0: Full detail")
+    print("  D: Toggle distance-based LOD")
+    print("  +/-: Adjust distance LOD scale")
     print("  Close window to exit")
     print("Color indicates octree depth (blue=shallow, red=deep)")
+    print(f"Distance LOD: {'ON' if use_distance_lod[0] else 'OFF'}, Scale: {lod_distance_scale[0]:.1f}")
     
     # Run the event loop
     loop.run()
