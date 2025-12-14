@@ -185,9 +185,11 @@ def create_sphere_sdf_volume(size: int) -> np.ndarray:
 
 
 def main():
-    # Request adapter and device
+    # Request adapter and device with float32-filterable feature for smooth texture sampling
     adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
-    device = adapter.request_device_sync()
+    device = adapter.request_device_sync(
+        required_features=["float32-filterable"],
+    )
     
     # Create the render canvas
     canvas = RenderCanvas(
@@ -222,11 +224,11 @@ def main():
         (VOLUME_SIZE, VOLUME_SIZE, VOLUME_SIZE),
     )
     
-    # Create sampler for 3D texture (nearest filtering for unfilterable-float textures)
+    # Create sampler for 3D texture with trilinear filtering for smooth surfaces
     volume_sampler = device.create_sampler(
-        mag_filter="nearest",
-        min_filter="nearest",
-        mipmap_filter="nearest",
+        mag_filter="linear",
+        min_filter="linear",
+        mipmap_filter="linear",
         address_mode_u="clamp-to-edge",
         address_mode_v="clamp-to-edge",
         address_mode_w="clamp-to-edge",
@@ -254,14 +256,14 @@ def main():
                 "binding": 1,
                 "visibility": wgpu.ShaderStage.FRAGMENT,
                 "texture": {
-                    "sample_type": "unfilterable-float",
+                    "sample_type": "float",
                     "view_dimension": "3d",
                 },
             },
             {
                 "binding": 2,
                 "visibility": wgpu.ShaderStage.FRAGMENT,
-                "sampler": {"type": "non-filtering"},
+                "sampler": {"type": "filtering"},
             },
         ]
     )
