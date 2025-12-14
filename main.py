@@ -7,12 +7,19 @@ Each octree node has border cells for seamless neighbor sampling.
 import numpy as np
 import wgpu
 import glfw
+import pickle
+import hashlib
+from pathlib import Path
 from rendercanvas.glfw import RenderCanvas, loop
 from dataclasses import dataclass
 from typing import Optional
 
+# Cache settings
+CACHE_DIR = Path("cache")
+CACHE_VERSION = 1  # Increment when cache format changes
+
 # Volume texture resolution per node (excluding borders)
-VOLUME_SIZE = 16
+VOLUME_SIZE = 32
 # Border size for neighbor sampling (1 cell on each side)
 BORDER_SIZE = 1
 # Total texture size including borders
@@ -145,7 +152,7 @@ def sample_sdf_world_vectorized(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> 
     # Add FBM noise displacement for organic surface
     noise_scale = 9.0  # Frequency of base noise
     amplitude = 0.12   # Strength of displacement
-    displacement = amplitude * fbm_3d(x * noise_scale, y * noise_scale, z * noise_scale, octaves=5)
+    displacement = amplitude * fbm_3d(x * noise_scale, y * noise_scale, z * noise_scale, octaves=6)
     
     return dist + displacement
 
@@ -297,6 +304,108 @@ def build_octree(center: np.ndarray, half_size: float) -> list[OctreeNode]:
             )
             nodes.append(child)
             queue.append(child.index)
+    
+    return nodes
+
+
+def get_cache_key() -> str:
+    """Generate a hash key based on SDF parameters for cache invalidation."""
+    # Include all parameters that affect the generated volumes
+    params = f"""
+    VOLUME_SIZE={VOLUME_SIZE}
+    BORDER_SIZE={BORDER_SIZE}
+    MAX_DEPTH={MAX_DEPTH}
+    CACHE_VERSION={CACHE_VERSION}
+    sphere_radius=0.41
+    noise_scale=9.0
+    amplitude=0.12
+    octaves=6
+    """
+    return hashlib.md5(params.encode()).hexdigest()[:16]
+
+
+def save_octree_cache(nodes: list[OctreeNode], cache_key: str) -> None:
+    """Save octree data to disk cache."""
+    CACHE_DIR.mkdir(exist_ok=True)
+    cache_file = CACHE_DIR / f"octree_{cache_key}.pkl"
+    
+    # Convert nodes to serializable format
+    cache_data = {
+        'cache_key': cache_key,
+        'nodes': []
+    }
+    
+    for node in nodes:
+        node_data = {
+            'center': node.center.tolist(),
+            'half_size': node.half_size,
+            'depth': node.depth,
+            'index': node.index,
+            'parent_index': node.parent_index,
+            'children_start': node.children_start,
+            'is_leaf': node.is_leaf,
+            'volume_data': node.volume_data.tolist() if node.volume_data is not None else None,
+        }
+        cache_data['nodes'].append(node_data)
+    
+    with open(cache_file, 'wb') as f:
+        pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    
+    print(f"  Saved cache to {cache_file}")
+
+
+def load_octree_cache(cache_key: str) -> Optional[list[OctreeNode]]:
+    """Load octree data from disk cache if available and valid."""
+    cache_file = CACHE_DIR / f"octree_{cache_key}.pkl"
+    
+    if not cache_file.exists():
+        return None
+    
+    try:
+        with open(cache_file, 'rb') as f:
+            cache_data = pickle.load(f)
+        
+        if cache_data.get('cache_key') != cache_key:
+            print("  Cache key mismatch, regenerating...")
+            return None
+        
+        # Reconstruct nodes
+        nodes = []
+        for node_data in cache_data['nodes']:
+            node = OctreeNode(
+                center=np.array(node_data['center'], dtype=np.float32),
+                half_size=node_data['half_size'],
+                depth=node_data['depth'],
+                index=node_data['index'],
+                parent_index=node_data['parent_index'],
+                children_start=node_data['children_start'],
+                volume_data=np.array(node_data['volume_data'], dtype=np.float32) if node_data['volume_data'] is not None else None,
+                is_leaf=node_data['is_leaf'],
+            )
+            nodes.append(node)
+        
+        print(f"  Loaded {len(nodes)} nodes from cache")
+        return nodes
+    
+    except Exception as e:
+        print(f"  Cache load failed: {e}")
+        return None
+
+
+def build_octree_cached(center: np.ndarray, half_size: float) -> list[OctreeNode]:
+    """Build octree with disk caching for faster subsequent loads."""
+    cache_key = get_cache_key()
+    print(f"  Cache key: {cache_key}")
+    
+    # Try to load from cache
+    nodes = load_octree_cache(cache_key)
+    if nodes is not None:
+        return nodes
+    
+    # Build fresh and save to cache
+    print("  Building fresh octree...")
+    nodes = build_octree(center, half_size)
+    save_octree_cache(nodes, cache_key)
     
     return nodes
 
@@ -691,13 +800,13 @@ fn shade(p: vec3f, normal: vec3f, rd: vec3f) -> vec3f {
     let half_vec = normalize(light_dir + view_dir);
     let n_dot_h = max(dot(normal, half_vec), 0.0);
     let spec_power = mix(8.0, 128.0, 1.0 - roughness);
-    let specular = pow(n_dot_h, spec_power) * shadow * (1.0 - roughness) * 0.5;
+    let specular = pow(n_dot_h, spec_power) * shadow * (1.0 - roughness) * 0.25;
     
     // Environment/Sky lighting (GI approximation)
     let sky_up = sky_color(normal);
     let sky_reflect = sky_color(reflect(rd, normal));
     let env_diffuse = albedo * sky_up * 0.15;
-    let env_specular = sky_reflect * (1.0 - roughness) * 0.1;
+    let env_specular = sky_reflect * (1.0 - roughness) * 0.05;
     
     // Fresnel for rim lighting and reflections
     let fresnel = pow(1.0 - max(dot(normal, view_dir), 0.0), 5.0);
@@ -726,7 +835,7 @@ fn shade(p: vec3f, normal: vec3f, rd: vec3f) -> vec3f {
 
 // Ray march through the octree volume
 fn ray_march(ro: vec3f, rd: vec3f) -> vec4f {
-    let MAX_STEPS = 200;
+    let MAX_STEPS = 400;
     let MAX_DIST = 15.0;
     let SURF_DIST = 0.0003;
     
@@ -744,7 +853,7 @@ fn ray_march(ro: vec3f, rd: vec3f) -> vec4f {
         }
         
         // Adaptive step size
-        t += max(d * 0.65, 0.001);
+        t += max(d * 0.5, 0.001);
         
         if (t > MAX_DIST) {
             break;
@@ -881,9 +990,9 @@ def main():
     render_texture_format = context.get_preferred_format(adapter)
     context.configure(device=device, format=render_texture_format)
     
-    # Build octree
+    # Build octree (with disk caching)
     print("Building octree...")
-    nodes = build_octree(
+    nodes = build_octree_cached(
         center=np.array([0.0, 0.0, 0.0], dtype=np.float32),
         half_size=1.0
     )
@@ -1129,9 +1238,9 @@ def main():
         last_mouse_pos[0] = xpos
         last_mouse_pos[1] = ypos
         
-        # Update camera rotation
-        camera_yaw[0] -= dx * mouse_sensitivity[0]
-        camera_pitch[0] -= dy * mouse_sensitivity[0]
+        # Update camera rotation (standard FPS: mouse right = look right, mouse up = look up)
+        camera_yaw[0] += dx * mouse_sensitivity[0]
+        camera_pitch[0] += dy * mouse_sensitivity[0]
         
         # Clamp pitch to avoid flipping
         camera_pitch[0] = max(-1.5, min(1.5, camera_pitch[0]))
