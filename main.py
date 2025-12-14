@@ -55,17 +55,83 @@ def sphere_sdf(p: np.ndarray, center: np.ndarray, radius: float) -> float:
 def sample_sdf_world(p: np.ndarray) -> float:
     """
     Sample the world SDF at a point. This is the "ground truth" SDF.
-    Sphere with sine displacement at origin.
+    Sphere with FBM noise displacement at origin.
     """
-    sphere_radius = 0.5
+    sphere_radius = 0.4
     dist = np.linalg.norm(p) - sphere_radius
     
-    # Add sine displacement for visual interest
-    freq = 8.0
-    amplitude = 0.05
-    displacement = amplitude * np.sin(p[0] * freq) * np.sin(p[1] * freq) * np.sin(p[2] * freq)
+    # Add FBM noise displacement for organic surface
+    noise_scale = 4.0
+    amplitude = 0.08
+    # Use vectorized version with single point
+    px = np.array([[[p[0] * noise_scale]]])
+    py = np.array([[[p[1] * noise_scale]]])
+    pz = np.array([[[p[2] * noise_scale]]])
+    displacement = amplitude * fbm_3d(px, py, pz, octaves=5)[0, 0, 0]
     
     return dist + displacement
+
+
+def hash_3d(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
+    """Simple hash function for 3D coordinates."""
+    # Use prime numbers for hashing
+    n = x * 374761393 + y * 668265263 + z * 1440670291
+    n = ((n >> 13) ^ n)
+    n = n * (n * n * 60493 + 19990303) + 1376312589
+    return (n & 0x7fffffff) / 0x7fffffff  # Normalize to [0, 1]
+
+
+def noise_3d(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
+    """Value noise in 3D - vectorized."""
+    # Integer coordinates
+    ix = np.floor(x).astype(np.int32)
+    iy = np.floor(y).astype(np.int32)
+    iz = np.floor(z).astype(np.int32)
+    
+    # Fractional coordinates
+    fx = x - ix
+    fy = y - iy
+    fz = z - iz
+    
+    # Smooth interpolation (smoothstep)
+    ux = fx * fx * (3 - 2 * fx)
+    uy = fy * fy * (3 - 2 * fy)
+    uz = fz * fz * (3 - 2 * fz)
+    
+    # Hash at 8 corners
+    n000 = hash_3d(ix, iy, iz)
+    n100 = hash_3d(ix + 1, iy, iz)
+    n010 = hash_3d(ix, iy + 1, iz)
+    n110 = hash_3d(ix + 1, iy + 1, iz)
+    n001 = hash_3d(ix, iy, iz + 1)
+    n101 = hash_3d(ix + 1, iy, iz + 1)
+    n011 = hash_3d(ix, iy + 1, iz + 1)
+    n111 = hash_3d(ix + 1, iy + 1, iz + 1)
+    
+    # Trilinear interpolation
+    nx00 = n000 * (1 - ux) + n100 * ux
+    nx10 = n010 * (1 - ux) + n110 * ux
+    nx01 = n001 * (1 - ux) + n101 * ux
+    nx11 = n011 * (1 - ux) + n111 * ux
+    
+    nxy0 = nx00 * (1 - uy) + nx10 * uy
+    nxy1 = nx01 * (1 - uy) + nx11 * uy
+    
+    return nxy0 * (1 - uz) + nxy1 * uz
+
+
+def fbm_3d(x: np.ndarray, y: np.ndarray, z: np.ndarray, octaves: int = 5) -> np.ndarray:
+    """Fractal Brownian Motion noise - vectorized."""
+    value = np.zeros_like(x)
+    amplitude = 0.5
+    frequency = 1.0
+    
+    for _ in range(octaves):
+        value += amplitude * (noise_3d(x * frequency, y * frequency, z * frequency) * 2 - 1)
+        frequency *= 2.0
+        amplitude *= 0.5
+    
+    return value
 
 
 def sample_sdf_world_vectorized(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
@@ -73,13 +139,13 @@ def sample_sdf_world_vectorized(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> 
     Vectorized version of sample_sdf_world for fast volume generation.
     x, y, z are 3D arrays of coordinates.
     """
-    sphere_radius = 0.4
+    sphere_radius = 0.41
     dist = np.sqrt(x**2 + y**2 + z**2) - sphere_radius
     
-    # Add sine displacement for visual interest
-    freq = 20.0
-    amplitude = 0.075
-    displacement = amplitude * np.sin(x * freq) * np.sin(y * freq) * np.sin(z * freq)
+    # Add FBM noise displacement for organic surface
+    noise_scale = 3.0  # Frequency of base noise
+    amplitude = 0.12   # Strength of displacement
+    displacement = amplitude * fbm_3d(x * noise_scale, y * noise_scale, z * noise_scale, octaves=5)
     
     return dist + displacement
 
@@ -382,13 +448,68 @@ fn sample_node_sdf(p: vec3f, node_idx: i32) -> f32 {
     return textureSampleLevel(volume_textures, volume_sampler, atlas_coord, 0.0).r;
 }
 
-// Analytical SDF for debugging
+// Hash function for noise
+fn hash3(p: vec3f) -> f32 {
+    var n = dot(p, vec3f(127.1, 311.7, 74.7));
+    return fract(sin(n) * 43758.5453123);
+}
+
+// Value noise 3D
+fn noise3(p: vec3f) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    
+    // Smoothstep interpolation
+    let u = f * f * (3.0 - 2.0 * f);
+    
+    // Hash at 8 corners
+    let n000 = hash3(i + vec3f(0.0, 0.0, 0.0));
+    let n100 = hash3(i + vec3f(1.0, 0.0, 0.0));
+    let n010 = hash3(i + vec3f(0.0, 1.0, 0.0));
+    let n110 = hash3(i + vec3f(1.0, 1.0, 0.0));
+    let n001 = hash3(i + vec3f(0.0, 0.0, 1.0));
+    let n101 = hash3(i + vec3f(1.0, 0.0, 1.0));
+    let n011 = hash3(i + vec3f(0.0, 1.0, 1.0));
+    let n111 = hash3(i + vec3f(1.0, 1.0, 1.0));
+    
+    // Trilinear interpolation
+    let nx00 = mix(n000, n100, u.x);
+    let nx10 = mix(n010, n110, u.x);
+    let nx01 = mix(n001, n101, u.x);
+    let nx11 = mix(n011, n111, u.x);
+    
+    let nxy0 = mix(nx00, nx10, u.y);
+    let nxy1 = mix(nx01, nx11, u.y);
+    
+    return mix(nxy0, nxy1, u.z);
+}
+
+// FBM (Fractal Brownian Motion) noise
+fn fbm(p: vec3f) -> f32 {
+    var value = 0.0;
+    var amplitude = 0.5;
+    var frequency = 1.0;
+    var pos = p;
+    
+    for (var i = 0; i < 5; i++) {
+        value += amplitude * (noise3(pos * frequency) * 2.0 - 1.0);
+        frequency *= 2.0;
+        amplitude *= 0.5;
+    }
+    
+    return value;
+}
+
+// Analytical SDF with FBM noise
 fn analytical_sdf(p: vec3f) -> f32 {
-    let sphere_radius = 0.5;
+    let sphere_radius = 0.4;
     let dist = length(p) - sphere_radius;
-    let freq = 8.0;
-    let amplitude = 0.05;
-    let displacement = amplitude * sin(p.x * freq) * sin(p.y * freq) * sin(p.z * freq);
+    
+    // FBM noise displacement
+    let noise_scale = 4.0;
+    let amplitude = 0.08;
+    let displacement = amplitude * fbm(p * noise_scale);
+    
     return dist + displacement;
 }
 
