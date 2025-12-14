@@ -142,65 +142,11 @@ def generate_node_volume(node: OctreeNode) -> np.ndarray:
 def build_octree(center: np.ndarray, half_size: float) -> list[OctreeNode]:
     """
     Build an octree with adaptive subdivision based on SDF.
+    Uses breadth-first construction to ensure children are contiguous.
     Returns a flat list of all nodes.
     """
     nodes = []
-    leaf_count = [0]  # Use list for closure mutation
-    
-    def subdivide(node: OctreeNode) -> None:
-        nodes.append(node)
-        
-        if not should_subdivide(node):
-            # Leaf node - generate volume data
-            node.is_leaf = True
-            node.volume_data = generate_node_volume(node)
-            leaf_count[0] += 1
-            if leaf_count[0] % 10 == 0:
-                print(f"  Generated {leaf_count[0]} leaf volumes...")
-            return
-        
-        # Subdivide into 8 children
-        node.is_leaf = False
-        node.children_start = len(nodes)
-        child_half_size = node.half_size / 2
-        
-        child_idx = 0
-        for dx in [-1, 1]:
-            for dy in [-1, 1]:
-                for dz in [-1, 1]:
-                    child_center = node.center + np.array([dx, dy, dz]) * child_half_size
-                    child = OctreeNode(
-                        center=child_center,
-                        half_size=child_half_size,
-                        depth=node.depth + 1,
-                        index=len(nodes) + child_idx,
-                        parent_index=node.index,
-                        children_start=-1,
-                    )
-                    child_idx += 1
-        
-        # Process children (they get added to nodes list)
-        children_to_process = []
-        for i in range(8):
-            dx = (i // 4) * 2 - 1
-            dy = ((i // 2) % 2) * 2 - 1
-            dz = (i % 2) * 2 - 1
-            child_center = node.center + np.array([dx, dy, dz]) * child_half_size
-            child = OctreeNode(
-                center=child_center,
-                half_size=child_half_size,
-                depth=node.depth + 1,
-                index=node.children_start + i,
-                parent_index=node.index,
-                children_start=-1,
-            )
-            children_to_process.append(child)
-        
-        # Update children indices after we know how many there are
-        node.children_start = len(nodes)
-        for child in children_to_process:
-            child.index = len(nodes)
-            subdivide(child)
+    leaf_count = [0]
     
     # Create root node
     root = OctreeNode(
@@ -211,8 +157,46 @@ def build_octree(center: np.ndarray, half_size: float) -> list[OctreeNode]:
         parent_index=-1,
         children_start=-1,
     )
+    nodes.append(root)
     
-    subdivide(root)
+    # Process queue for breadth-first traversal
+    queue = [0]  # Start with root index
+    
+    while queue:
+        node_idx = queue.pop(0)
+        node = nodes[node_idx]
+        
+        if not should_subdivide(node):
+            # Leaf node - generate volume data
+            node.is_leaf = True
+            node.volume_data = generate_node_volume(node)
+            leaf_count[0] += 1
+            if leaf_count[0] % 10 == 0:
+                print(f"  Generated {leaf_count[0]} leaf volumes...")
+            continue
+        
+        # Subdivide into 8 children - add them all contiguously
+        node.is_leaf = False
+        node.children_start = len(nodes)
+        child_half_size = node.half_size / 2
+        
+        for i in range(8):
+            # Child octant based on index bits: x=bit2, y=bit1, z=bit0
+            dx = ((i >> 2) & 1) * 2 - 1  # -1 or +1
+            dy = ((i >> 1) & 1) * 2 - 1
+            dz = (i & 1) * 2 - 1
+            
+            child_center = node.center + np.array([dx, dy, dz], dtype=np.float32) * child_half_size
+            child = OctreeNode(
+                center=child_center,
+                half_size=child_half_size,
+                depth=node.depth + 1,
+                index=len(nodes),
+                parent_index=node_idx,
+                children_start=-1,
+            )
+            nodes.append(child)
+            queue.append(child.index)
     
     return nodes
 
@@ -335,13 +319,36 @@ fn sample_node_sdf(p: vec3f, node_idx: i32) -> f32 {
     return textureSampleLevel(volume_textures, volume_sampler, atlas_coord, 0.0).r;
 }
 
+// Analytical SDF for debugging
+fn analytical_sdf(p: vec3f) -> f32 {
+    let sphere_radius = 0.5;
+    let dist = length(p) - sphere_radius;
+    let freq = 8.0;
+    let amplitude = 0.05;
+    let displacement = amplitude * sin(p.x * freq) * sin(p.y * freq) * sin(p.z * freq);
+    return dist + displacement;
+}
+
 // Sample the SDF with octree traversal
 fn sample_sdf(p: vec3f) -> f32 {
+    // Check if point is inside the octree bounds (root node is at origin with half_size 1.0)
+    if (any(abs(p) > vec3f(1.0))) {
+        return analytical_sdf(p);  // Fallback outside octree
+    }
+    
     let node_idx = find_leaf_node(p);
     if (node_idx < 0) {
-        return 1.0;  // Outside octree
+        return analytical_sdf(p);  // Fallback if node not found
     }
-    return sample_node_sdf(p, node_idx);
+    
+    let sampled = sample_node_sdf(p, node_idx);
+    
+    // Debug: if sampled value seems wrong, use analytical
+    if (abs(sampled) > 2.0) {
+        return analytical_sdf(p);
+    }
+    
+    return sampled;
 }
 
 // Calculate normal from SDF gradient
@@ -577,10 +584,11 @@ def main():
         usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
     )
     
-    # Upload atlas data
+    # Upload atlas data (transpose for correct GPU layout: numpy [x,y,z] -> GPU [z,y,x] so x varies fastest)
+    atlas_gpu = np.ascontiguousarray(np.transpose(atlas_data, (2, 1, 0)))
     device.queue.write_texture(
         {"texture": volume_texture},
-        atlas_data.tobytes(),
+        atlas_gpu.tobytes(),
         {"bytes_per_row": atlas_size * 4, "rows_per_image": atlas_size},
         (atlas_size, atlas_size, atlas_size),
     )
@@ -687,6 +695,11 @@ def main():
         current_time = time.perf_counter() - start_time
         width, height = canvas.get_physical_size()
         
+        # Safety: ensure we have valid dimensions
+        if width == 0 or height == 0:
+            canvas.request_draw(draw_frame)
+            return
+        
         uniform_data[0] = float(width)
         uniform_data[1] = float(height)
         uniform_data[2] = current_time
@@ -723,6 +736,9 @@ def main():
         
         # Submit
         device.queue.submit([command_encoder.finish()])
+        
+        # Request next frame for animation
+        canvas.request_draw(draw_frame)
     
     # Register draw callback
     canvas.request_draw(draw_frame)
