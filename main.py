@@ -17,10 +17,10 @@ VOLUME_SIZE = 16
 BORDER_SIZE = 1
 # Total texture size including borders
 TEXTURE_SIZE = VOLUME_SIZE + 2 * BORDER_SIZE
-# Maximum octree depth (3 gives up to ~300 leaf nodes near sphere surface)
-MAX_DEPTH = 3
+# Maximum octree depth (5 gives high detail near surface)
+MAX_DEPTH = 5
 # Maximum number of octree nodes (for GPU buffer allocation)
-MAX_NODES = 512
+MAX_NODES = 2048
 
 
 @dataclass
@@ -77,8 +77,8 @@ def sample_sdf_world_vectorized(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> 
     dist = np.sqrt(x**2 + y**2 + z**2) - sphere_radius
     
     # Add sine displacement for visual interest
-    freq = 8.0
-    amplitude = 0.05
+    freq = 20.0
+    amplitude = 0.075
     displacement = amplitude * np.sin(x * freq) * np.sin(y * freq) * np.sin(z * freq)
     
     return dist + displacement
@@ -110,6 +110,31 @@ def should_subdivide(node: OctreeNode, threshold: float = 0.1) -> bool:
     surface_crosses = min_sdf < 0 and max_sdf > 0
     
     return surface_crosses
+
+
+def is_node_near_surface(node: OctreeNode, threshold_factor: float = 2.0) -> bool:
+    """
+    Check if the surface passes through or near this node.
+    Returns False for nodes entirely inside or outside the surface.
+    """
+    # Sample corners and center
+    samples = []
+    for dx in [-1, 0, 1]:
+        for dy in [-1, 0, 1]:
+            for dz in [-1, 0, 1]:
+                pos = node.center + np.array([dx, dy, dz], dtype=np.float32) * node.half_size
+                samples.append(sample_sdf_world(pos))
+    
+    min_sdf = min(samples)
+    max_sdf = max(samples)
+    
+    # Surface crosses if sign change
+    if min_sdf < 0 and max_sdf > 0:
+        return True
+    
+    # Surface is near if closest distance is less than node diagonal
+    threshold = node.half_size * threshold_factor * np.sqrt(3)
+    return abs(min_sdf) < threshold or abs(max_sdf) < threshold
 
 
 def generate_node_volume(node: OctreeNode) -> np.ndarray:
@@ -163,16 +188,21 @@ def build_octree(center: np.ndarray, half_size: float) -> list[OctreeNode]:
     # Process queue for breadth-first traversal
     queue = [0]  # Start with root index
     volume_count = [0]
+    skipped_count = [0]
     
     while queue:
         node_idx = queue.pop(0)
         node = nodes[node_idx]
         
-        # Generate volume data for ALL nodes (needed for LOD switching)
-        node.volume_data = generate_node_volume(node)
-        volume_count[0] += 1
-        if volume_count[0] % 10 == 0:
-            print(f"  Generated {volume_count[0]} volumes...")
+        # Only generate volume data for nodes near the surface
+        if is_node_near_surface(node):
+            node.volume_data = generate_node_volume(node)
+            volume_count[0] += 1
+            if volume_count[0] % 20 == 0:
+                print(f"  Generated {volume_count[0]} volumes (skipped {skipped_count[0]} empty)...")
+        else:
+            node.volume_data = None
+            skipped_count[0] += 1
         
         if not should_subdivide(node):
             # Leaf node - no children
@@ -212,7 +242,7 @@ struct Uniforms {
     time: f32,
     num_nodes: u32,
     max_lod_depth: u32,
-    _pad1: u32,
+    volumes_per_side: u32,
     _pad2: u32,
     _pad3: u32,
 }
@@ -312,16 +342,16 @@ fn sample_node_sdf(p: vec3f, node_idx: i32) -> f32 {
         return 1.0;  // Not a leaf node
     }
     
-    // Sample from the combined 3D texture (volumes stacked in Z)
-    let volumes_per_side = 8u;  // 8x8 grid of volumes in XY, stacked in Z
-    let vol_x = u32(volume_idx) % volumes_per_side;
-    let vol_y = (u32(volume_idx) / volumes_per_side) % volumes_per_side;
-    let vol_z = u32(volume_idx) / (volumes_per_side * volumes_per_side);
+    // Sample from the combined 3D texture (volumes arranged in 3D grid)
+    let vps = uniforms.volumes_per_side;
+    let vol_x = u32(volume_idx) % vps;
+    let vol_y = (u32(volume_idx) / vps) % vps;
+    let vol_z = u32(volume_idx) / (vps * vps);
     
     let atlas_coord = vec3f(
-        (f32(vol_x) + tex_coord.x) / f32(volumes_per_side),
-        (f32(vol_y) + tex_coord.y) / f32(volumes_per_side),
-        (f32(vol_z) + tex_coord.z) / f32(volumes_per_side)
+        (f32(vol_x) + tex_coord.x) / f32(vps),
+        (f32(vol_y) + tex_coord.y) / f32(vps),
+        (f32(vol_z) + tex_coord.z) / f32(vps)
     );
     
     return textureSampleLevel(volume_textures, volume_sampler, atlas_coord, 0.0).r;
@@ -349,14 +379,13 @@ fn sample_sdf(p: vec3f) -> f32 {
         return analytical_sdf(p);  // Fallback if node not found
     }
     
-    let sampled = sample_node_sdf(p, node_idx);
-    
-    // Debug: if sampled value seems wrong, use analytical
-    if (abs(sampled) > 2.0) {
-        return analytical_sdf(p);
+    // Check if this node has volume data (volume_index >= 0)
+    let node = nodes[node_idx];
+    if (node.volume_index < 0) {
+        return analytical_sdf(p);  // Empty node, use analytical
     }
     
-    return sampled;
+    return sample_node_sdf(p, node_idx);
 }
 
 // Calculate normal from SDF gradient
@@ -443,7 +472,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     
     // Camera setup - orbiting around the scene
     let angle = uniforms.time * 0.3;
-    let cam_dist = 2.0;
+    let cam_dist = 1.1;
     let cam_pos = vec3f(
         sin(angle) * cam_dist,
         sin(uniforms.time * 0.2) * 0.3 + 0.3,
@@ -469,7 +498,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
 """
 
 
-def create_volume_atlas(nodes: list[OctreeNode]) -> tuple[np.ndarray, dict[int, int]]:
+def create_volume_atlas(nodes: list[OctreeNode]) -> tuple[np.ndarray, dict[int, int], int]:
     """
     Create a 3D texture atlas containing ALL node volumes (for LOD support).
     Returns the atlas data and a mapping from node index to volume index.
@@ -480,9 +509,10 @@ def create_volume_atlas(nodes: list[OctreeNode]) -> tuple[np.ndarray, dict[int, 
     
     print(f"Creating atlas for {num_volumes} node volumes")
     
-    # Arrange volumes in a 3D grid
-    volumes_per_side = 8  # 8x8x8 = 512 max volumes
+    # Arrange volumes in a 3D grid - calculate needed size
+    volumes_per_side = max(8, int(np.ceil(num_volumes ** (1/3))))  # At least 8, or more if needed
     atlas_size = volumes_per_side * TEXTURE_SIZE
+    print(f"  Atlas grid: {volumes_per_side}x{volumes_per_side}x{volumes_per_side} = {volumes_per_side**3} slots")
     
     atlas = np.zeros((atlas_size, atlas_size, atlas_size), dtype=np.float32)
     node_to_volume = {}
@@ -506,7 +536,7 @@ def create_volume_atlas(nodes: list[OctreeNode]) -> tuple[np.ndarray, dict[int, 
         
         node_to_volume[node.index] = vol_idx
     
-    return atlas, node_to_volume
+    return atlas, node_to_volume, volumes_per_side
 
 
 def create_node_buffer_data(nodes: list[OctreeNode], node_to_volume: dict[int, int]) -> np.ndarray:
@@ -565,7 +595,7 @@ def main():
     
     # Create volume atlas
     print("Creating volume atlas...")
-    atlas_data, node_to_volume = create_volume_atlas(nodes)
+    atlas_data, node_to_volume, volumes_per_side = create_volume_atlas(nodes)
     print(f"Atlas size: {atlas_data.shape}")
     
     # Create 3D atlas texture
@@ -692,7 +722,7 @@ def main():
     
     def key_callback(window, key, scancode, action, mods):
         if action == glfw.PRESS or action == glfw.REPEAT:
-            # Number keys 1-4 set LOD level (0-3 depth limit)
+            # Number keys 1-6 set LOD level (0-5 depth limit)
             if key == glfw.KEY_1:
                 current_lod[0] = 0
                 print(f"LOD: 0 (root only)")
@@ -704,7 +734,13 @@ def main():
                 print(f"LOD: 2")
             elif key == glfw.KEY_4:
                 current_lod[0] = 3
-                print(f"LOD: 3 (max detail)")
+                print(f"LOD: 3")
+            elif key == glfw.KEY_5:
+                current_lod[0] = 4
+                print(f"LOD: 4")
+            elif key == glfw.KEY_6:
+                current_lod[0] = 5
+                print(f"LOD: 5 (max detail)")
             elif key == glfw.KEY_0:
                 current_lod[0] = MAX_DEPTH
                 print(f"LOD: {MAX_DEPTH} (full detail)")
@@ -728,7 +764,7 @@ def main():
         int_view = uniform_data[3:8].view(np.uint32)
         int_view[0] = len(nodes)
         int_view[1] = current_lod[0]
-        int_view[2] = 0  # padding
+        int_view[2] = volumes_per_side
         int_view[3] = 0  # padding
         int_view[4] = 0  # padding
         
@@ -769,7 +805,7 @@ def main():
     
     print("Starting render loop...")
     print("Controls:")
-    print("  1-4: Set LOD level (1=coarse, 4=fine)")
+    print(f"  1-6: Set LOD level (1=coarse, 6=finest, max={MAX_DEPTH})")
     print("  0: Full detail")
     print("  Close window to exit")
     print("Color indicates octree depth (blue=shallow, red=deep)")
