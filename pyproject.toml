@@ -1,0 +1,12 @@
+[project]
+name = "pymarch"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "glfw>=2.10.0",
+    "numpy>=2.3.5",
+    "rendercanvas>=2.4.2",
+    "wgpu>=0.28.1",
+]
