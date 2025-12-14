@@ -20,7 +20,7 @@ CACHE_DIR = Path("cache")
 CACHE_VERSION = 1  # Increment when cache format changes
 
 # Volume texture resolution per node (excluding borders)
-VOLUME_SIZE = 32
+VOLUME_SIZE = 40
 # Border size for neighbor sampling (1 cell on each side)
 BORDER_SIZE = 1
 # Total texture size including borders
@@ -151,9 +151,9 @@ def sample_sdf_world_vectorized(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> 
     dist = np.sqrt(x**2 + y**2 + z**2) - sphere_radius
     
     # Add FBM noise displacement for organic surface
-    noise_scale = 9.0  # Frequency of base noise
-    amplitude = 0.12   # Strength of displacement
-    displacement = amplitude * fbm_3d(x * noise_scale, y * noise_scale, z * noise_scale, octaves=6)
+    noise_scale = 32.0  # Frequency of base noise
+    amplitude = 0.04   # Strength of displacement
+    displacement = amplitude * fbm_3d(x * noise_scale, y * noise_scale, z * noise_scale, octaves=4)
     
     return dist + displacement
 
@@ -1151,11 +1151,15 @@ def main(fullscreen: bool = False):
     # Get the GLFW window handle for keyboard input
     glfw_window = canvas._window
     
-    # Set initial fullscreen if requested
+    # Set initial fullscreen if requested (borderless fullscreen)
     if fullscreen:
         monitor = glfw.get_primary_monitor()
         mode = glfw.get_video_mode(monitor)
-        glfw.set_window_monitor(glfw_window, monitor, 0, 0, mode.size.width, mode.size.height, mode.refresh_rate)
+        glfw.set_window_attrib(glfw_window, glfw.DECORATED, False)
+        glfw.set_window_pos(glfw_window, 0, 0)
+        glfw.set_window_size(glfw_window, mode.size.width, mode.size.height)
+        is_fullscreen[0] = True
+        print(f"Starting in fullscreen mode ({mode.size.width}x{mode.size.height})")
     
     def toggle_fullscreen():
         """Toggle between fullscreen and windowed mode."""
@@ -1163,7 +1167,8 @@ def main(fullscreen: bool = False):
         mode = glfw.get_video_mode(monitor)
         
         if is_fullscreen[0]:
-            # Switch to windowed
+            # Switch to windowed - restore decorations first
+            glfw.set_window_attrib(glfw_window, glfw.DECORATED, True)
             glfw.set_window_monitor(
                 glfw_window, None,
                 windowed_pos[0][0], windowed_pos[0][1],
@@ -1176,14 +1181,15 @@ def main(fullscreen: bool = False):
             # Save current window state
             windowed_pos[0] = glfw.get_window_pos(glfw_window)
             windowed_size[0] = glfw.get_window_size(glfw_window)
-            # Switch to fullscreen
-            glfw.set_window_monitor(
-                glfw_window, monitor,
-                0, 0, mode.size.width, mode.size.height,
-                mode.refresh_rate
-            )
+            
+            # Use borderless fullscreen for better Windows compatibility
+            # Remove window decorations and cover the full screen
+            glfw.set_window_attrib(glfw_window, glfw.DECORATED, False)
+            glfw.set_window_pos(glfw_window, 0, 0)
+            glfw.set_window_size(glfw_window, mode.size.width, mode.size.height)
+            
             is_fullscreen[0] = True
-            print("Switched to fullscreen mode")
+            print(f"Switched to fullscreen mode ({mode.size.width}x{mode.size.height})")
     
     def key_callback(window, key, scancode, action, mods):
         # Track key states for smooth movement
@@ -1288,14 +1294,37 @@ def main(fullscreen: bool = False):
         # Clamp pitch to avoid flipping
         camera_pitch[0] = max(-1.5, min(1.5, camera_pitch[0]))
     
+    # Window state tracking
+    window_minimized = [False]
+    
+    def window_iconify_callback(window, iconified):
+        """Handle window minimize/restore."""
+        window_minimized[0] = iconified
+        if not iconified:
+            # Window restored - request a new frame
+            print("Window restored")
+            canvas.request_draw(draw_frame)
+    
+    def window_focus_callback(window, focused):
+        """Handle window focus changes."""
+        if focused and not window_minimized[0]:
+            # Window gained focus - ensure rendering continues
+            canvas.request_draw(draw_frame)
+    
     glfw.set_key_callback(glfw_window, key_callback)
     glfw.set_mouse_button_callback(glfw_window, mouse_button_callback)
     glfw.set_cursor_pos_callback(glfw_window, cursor_pos_callback)
+    glfw.set_window_iconify_callback(glfw_window, window_iconify_callback)
+    glfw.set_window_focus_callback(glfw_window, window_focus_callback)
     
     # Track time for delta calculation
     last_frame_time = [time.perf_counter()]
     
     def draw_frame():
+        # Skip rendering if window is minimized
+        if window_minimized[0]:
+            return
+        
         # Calculate delta time for smooth movement
         current_frame_time = time.perf_counter()
         delta_time = current_frame_time - last_frame_time[0]
@@ -1304,7 +1333,7 @@ def main(fullscreen: bool = False):
         current_time = current_frame_time - start_time
         width, height = canvas.get_physical_size()
         
-        # Safety: ensure we have valid dimensions
+        # Safety: ensure we have valid dimensions (can happen during resize/minimize)
         if width == 0 or height == 0:
             canvas.request_draw(draw_frame)
             return
