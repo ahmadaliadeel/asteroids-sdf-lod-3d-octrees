@@ -62,7 +62,7 @@ def sample_sdf_world(p: np.ndarray) -> float:
     
     # Add FBM noise displacement for organic surface
     noise_scale = 4.0
-    amplitude = 0.08
+    amplitude = 0.06
     # Use vectorized version with single point
     px = np.array([[[p[0] * noise_scale]]])
     py = np.array([[[p[1] * noise_scale]]])
@@ -143,7 +143,7 @@ def sample_sdf_world_vectorized(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> 
     dist = np.sqrt(x**2 + y**2 + z**2) - sphere_radius
     
     # Add FBM noise displacement for organic surface
-    noise_scale = 3.0  # Frequency of base noise
+    noise_scale = 9.0  # Frequency of base noise
     amplitude = 0.12   # Strength of displacement
     displacement = amplitude * fbm_3d(x * noise_scale, y * noise_scale, z * noise_scale, octaves=5)
     
@@ -312,7 +312,11 @@ struct Uniforms {
     lod_distance_scale: f32,  // Controls how aggressively LOD drops with distance
     use_distance_lod: u32,    // 0 = fixed LOD, 1 = distance-based LOD
     camera_pos: vec3f,
-    _pad: f32,
+    camera_yaw: f32,
+    camera_pitch: f32,
+    _pad1: f32,
+    _pad2: f32,
+    _pad3: f32,
 }
 
 struct OctreeNode {
@@ -616,23 +620,29 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     var uv = in.uv * 2.0 - 1.0;
     uv.x *= aspect;
     
-    // Camera setup - orbiting around the scene
-    let angle = uniforms.time * 0.3;
-    let cam_dist = 1.1;
-    let cam_pos = vec3f(
-        sin(angle) * cam_dist,
-        sin(uniforms.time * 0.2) * 0.3 + 0.3,
-        cos(angle) * cam_dist
+    // FPS Camera setup from uniforms
+    let cam_pos = uniforms.camera_pos;
+    let yaw = uniforms.camera_yaw;
+    let pitch = uniforms.camera_pitch;
+    
+    // Calculate forward vector from yaw and pitch
+    let cos_pitch = cos(pitch);
+    let sin_pitch = sin(pitch);
+    let cos_yaw = cos(yaw);
+    let sin_yaw = sin(yaw);
+    
+    let forward = vec3f(
+        cos_pitch * sin_yaw,
+        sin_pitch,
+        cos_pitch * cos_yaw
     );
     
-    // Look at center
-    let look_at = vec3f(0.0, 0.0, 0.0);
-    let forward = normalize(look_at - cam_pos);
-    let right = normalize(cross(vec3f(0.0, 1.0, 0.0), forward));
-    let up = cross(forward, right);
+    // Right and up vectors
+    let right = vec3f(cos_yaw, 0.0, -sin_yaw);
+    let up = cross(right, forward);
     
-    // Ray direction
-    let fov = 1.5;
+    // Ray direction with FOV
+    let fov = 1.2;
     let rd = normalize(forward * fov + right * uv.x + up * uv.y);
     
     // Ray march
@@ -794,6 +804,21 @@ def main():
     use_distance_lod = [1]  # 1 = enabled, 0 = fixed LOD
     lod_distance_scale = [3.0]  # How aggressively LOD drops with distance
     
+    # FPS Camera state
+    camera_pos = [1.5, 0.5, 1.5]  # x, y, z position
+    camera_yaw = [-2.3]  # Rotation around Y axis (radians)
+    camera_pitch = [-0.3]  # Rotation around X axis (radians)
+    mouse_sensitivity = [0.003]
+    move_speed = [0.5]
+    mouse_captured = [False]
+    last_mouse_pos = [0.0, 0.0]
+    
+    # Key states for smooth movement
+    keys_pressed = {
+        'w': False, 's': False, 'a': False, 'd': False,
+        'space': False, 'shift': False
+    }
+    
     # Create shader module
     shader_module = device.create_shader_module(code=SHADER_CODE)
     
@@ -870,8 +895,43 @@ def main():
     glfw_window = canvas._window
     
     def key_callback(window, key, scancode, action, mods):
+        # Track key states for smooth movement
+        if action == glfw.PRESS:
+            if key == glfw.KEY_W:
+                keys_pressed['w'] = True
+            elif key == glfw.KEY_S:
+                keys_pressed['s'] = True
+            elif key == glfw.KEY_A:
+                keys_pressed['a'] = True
+            elif key == glfw.KEY_D and not mods:  # D without modifiers for movement
+                keys_pressed['d'] = True
+            elif key == glfw.KEY_SPACE:
+                keys_pressed['space'] = True
+            elif key == glfw.KEY_LEFT_SHIFT or key == glfw.KEY_RIGHT_SHIFT:
+                keys_pressed['shift'] = True
+            # Escape releases mouse
+            elif key == glfw.KEY_ESCAPE:
+                mouse_captured[0] = False
+                glfw.set_input_mode(window, glfw.CURSOR, glfw.CURSOR_NORMAL)
+                print("Mouse released - click window to capture")
+        
+        elif action == glfw.RELEASE:
+            if key == glfw.KEY_W:
+                keys_pressed['w'] = False
+            elif key == glfw.KEY_S:
+                keys_pressed['s'] = False
+            elif key == glfw.KEY_A:
+                keys_pressed['a'] = False
+            elif key == glfw.KEY_D:
+                keys_pressed['d'] = False
+            elif key == glfw.KEY_SPACE:
+                keys_pressed['space'] = False
+            elif key == glfw.KEY_LEFT_SHIFT or key == glfw.KEY_RIGHT_SHIFT:
+                keys_pressed['shift'] = False
+        
+        # LOD controls (on press/repeat)
         if action == glfw.PRESS or action == glfw.REPEAT:
-            # Number keys 1-6 set max LOD level (0-5 depth limit)
+            # Number keys 1-6 set max LOD level
             if key == glfw.KEY_1:
                 current_lod[0] = 0
                 print(f"Max LOD: 0 (root only)")
@@ -893,8 +953,8 @@ def main():
             elif key == glfw.KEY_0:
                 current_lod[0] = MAX_DEPTH
                 print(f"Max LOD: {MAX_DEPTH} (full detail)")
-            # D key toggles distance-based LOD
-            elif key == glfw.KEY_D:
+            # L key toggles distance-based LOD (changed from D)
+            elif key == glfw.KEY_L:
                 use_distance_lod[0] = 1 - use_distance_lod[0]
                 mode = "Distance-based" if use_distance_lod[0] else "Fixed"
                 print(f"LOD Mode: {mode}")
@@ -906,11 +966,48 @@ def main():
                 lod_distance_scale[0] = max(0.5, lod_distance_scale[0] - 0.5)
                 print(f"LOD Distance Scale: {lod_distance_scale[0]:.1f}")
     
+    def mouse_button_callback(window, button, action, mods):
+        if button == glfw.MOUSE_BUTTON_LEFT and action == glfw.PRESS:
+            if not mouse_captured[0]:
+                mouse_captured[0] = True
+                glfw.set_input_mode(window, glfw.CURSOR, glfw.CURSOR_DISABLED)
+                # Get current mouse position
+                x, y = glfw.get_cursor_pos(window)
+                last_mouse_pos[0] = x
+                last_mouse_pos[1] = y
+                print("Mouse captured - ESC to release")
+    
+    def cursor_pos_callback(window, xpos, ypos):
+        if not mouse_captured[0]:
+            return
+        
+        # Calculate mouse delta
+        dx = xpos - last_mouse_pos[0]
+        dy = ypos - last_mouse_pos[1]
+        last_mouse_pos[0] = xpos
+        last_mouse_pos[1] = ypos
+        
+        # Update camera rotation
+        camera_yaw[0] -= dx * mouse_sensitivity[0]
+        camera_pitch[0] -= dy * mouse_sensitivity[0]
+        
+        # Clamp pitch to avoid flipping
+        camera_pitch[0] = max(-1.5, min(1.5, camera_pitch[0]))
+    
     glfw.set_key_callback(glfw_window, key_callback)
+    glfw.set_mouse_button_callback(glfw_window, mouse_button_callback)
+    glfw.set_cursor_pos_callback(glfw_window, cursor_pos_callback)
+    
+    # Track time for delta calculation
+    last_frame_time = [time.perf_counter()]
     
     def draw_frame():
-        # Update uniforms
-        current_time = time.perf_counter() - start_time
+        # Calculate delta time for smooth movement
+        current_frame_time = time.perf_counter()
+        delta_time = current_frame_time - last_frame_time[0]
+        last_frame_time[0] = current_frame_time
+        
+        current_time = current_frame_time - start_time
         width, height = canvas.get_physical_size()
         
         # Safety: ensure we have valid dimensions
@@ -918,12 +1015,48 @@ def main():
             canvas.request_draw(draw_frame)
             return
         
-        # Calculate camera position (same as shader)
-        angle = current_time * 0.3
-        cam_dist = 1.1
-        cam_x = np.sin(angle) * cam_dist
-        cam_y = np.sin(current_time * 0.2) * 0.3 + 0.3
-        cam_z = np.cos(angle) * cam_dist
+        # Calculate camera forward/right vectors from yaw and pitch
+        cos_pitch = np.cos(camera_pitch[0])
+        sin_pitch = np.sin(camera_pitch[0])
+        cos_yaw = np.cos(camera_yaw[0])
+        sin_yaw = np.sin(camera_yaw[0])
+        
+        # Forward vector (looking direction)
+        forward_x = cos_pitch * sin_yaw
+        forward_y = sin_pitch
+        forward_z = cos_pitch * cos_yaw
+        
+        # Right vector (perpendicular to forward, in XZ plane)
+        right_x = cos_yaw
+        right_z = -sin_yaw
+        
+        # Handle movement input
+        move_x, move_y, move_z = 0.0, 0.0, 0.0
+        speed = move_speed[0] * delta_time
+        
+        if keys_pressed['w']:
+            move_x += forward_x * speed
+            move_y += forward_y * speed
+            move_z += forward_z * speed
+        if keys_pressed['s']:
+            move_x -= forward_x * speed
+            move_y -= forward_y * speed
+            move_z -= forward_z * speed
+        if keys_pressed['a']:
+            move_x -= right_x * speed
+            move_z -= right_z * speed
+        if keys_pressed['d']:
+            move_x += right_x * speed
+            move_z += right_z * speed
+        if keys_pressed['space']:
+            move_y += speed
+        if keys_pressed['shift']:
+            move_y -= speed
+        
+        # Update camera position
+        camera_pos[0] += move_x
+        camera_pos[1] += move_y
+        camera_pos[2] += move_z
         
         uniform_data[0] = float(width)
         uniform_data[1] = float(height)
@@ -937,11 +1070,15 @@ def main():
         uniform_data[6] = lod_distance_scale[0]
         int_view2 = uniform_data[7:8].view(np.uint32)
         int_view2[0] = use_distance_lod[0]
-        # Camera position
-        uniform_data[8] = cam_x
-        uniform_data[9] = cam_y
-        uniform_data[10] = cam_z
-        uniform_data[11] = 0.0  # padding
+        # Camera position and direction
+        uniform_data[8] = camera_pos[0]
+        uniform_data[9] = camera_pos[1]
+        uniform_data[10] = camera_pos[2]
+        uniform_data[11] = camera_yaw[0]
+        uniform_data[12] = camera_pitch[0]
+        uniform_data[13] = 0.0  # padding
+        uniform_data[14] = 0.0  # padding
+        uniform_data[15] = 0.0  # padding
         
         device.queue.write_buffer(uniform_buffer, 0, uniform_data.tobytes())
         
@@ -980,13 +1117,17 @@ def main():
     
     print("Starting render loop...")
     print("Controls:")
+    print("  WASD: Move camera")
+    print("  Space/Shift: Move up/down")
+    print("  Mouse: Look around (click to capture, ESC to release)")
     print(f"  1-6: Set max LOD level (1=coarse, 6=finest, max={MAX_DEPTH})")
     print("  0: Full detail")
-    print("  D: Toggle distance-based LOD")
+    print("  L: Toggle distance-based LOD")
     print("  +/-: Adjust distance LOD scale")
     print("  Close window to exit")
     print("Color indicates octree depth (blue=shallow, red=deep)")
     print(f"Distance LOD: {'ON' if use_distance_lod[0] else 'OFF'}, Scale: {lod_distance_scale[0]:.1f}")
+    print("Click window to capture mouse...")
     
     # Run the event loop
     loop.run()
