@@ -9,6 +9,7 @@ import wgpu
 import glfw
 import pickle
 import hashlib
+import argparse
 from pathlib import Path
 from rendercanvas.glfw import RenderCanvas, loop
 from dataclasses import dataclass
@@ -971,7 +972,7 @@ def create_node_buffer_data(nodes: list[OctreeNode], node_to_volume: dict[int, i
     return result
 
 
-def main():
+def main(fullscreen: bool = False):
     # Request adapter and device with float32-filterable feature
     adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
     device = adapter.request_device_sync(
@@ -981,9 +982,14 @@ def main():
     # Create the render canvas
     canvas = RenderCanvas(
         title="SDF Ray Marching - Octree LOD",
-        size=(1024, 768),
+        size=(1920, 1080) if fullscreen else (1024, 768),
         max_fps=60,
     )
+    
+    # Fullscreen state tracking
+    is_fullscreen = [fullscreen]
+    windowed_size = [(1024, 768)]
+    windowed_pos = [(100, 100)]
     
     # Get the render context
     context = canvas.get_context("wgpu")
@@ -1145,6 +1151,40 @@ def main():
     # Get the GLFW window handle for keyboard input
     glfw_window = canvas._window
     
+    # Set initial fullscreen if requested
+    if fullscreen:
+        monitor = glfw.get_primary_monitor()
+        mode = glfw.get_video_mode(monitor)
+        glfw.set_window_monitor(glfw_window, monitor, 0, 0, mode.size.width, mode.size.height, mode.refresh_rate)
+    
+    def toggle_fullscreen():
+        """Toggle between fullscreen and windowed mode."""
+        monitor = glfw.get_primary_monitor()
+        mode = glfw.get_video_mode(monitor)
+        
+        if is_fullscreen[0]:
+            # Switch to windowed
+            glfw.set_window_monitor(
+                glfw_window, None,
+                windowed_pos[0][0], windowed_pos[0][1],
+                windowed_size[0][0], windowed_size[0][1],
+                0
+            )
+            is_fullscreen[0] = False
+            print("Switched to windowed mode")
+        else:
+            # Save current window state
+            windowed_pos[0] = glfw.get_window_pos(glfw_window)
+            windowed_size[0] = glfw.get_window_size(glfw_window)
+            # Switch to fullscreen
+            glfw.set_window_monitor(
+                glfw_window, monitor,
+                0, 0, mode.size.width, mode.size.height,
+                mode.refresh_rate
+            )
+            is_fullscreen[0] = True
+            print("Switched to fullscreen mode")
+    
     def key_callback(window, key, scancode, action, mods):
         # Track key states for smooth movement
         if action == glfw.PRESS:
@@ -1165,6 +1205,9 @@ def main():
                 mouse_captured[0] = False
                 glfw.set_input_mode(window, glfw.CURSOR, glfw.CURSOR_NORMAL)
                 print("Mouse released - click window to capture")
+            # F11 toggles fullscreen
+            elif key == glfw.KEY_F11:
+                toggle_fullscreen()
         
         elif action == glfw.RELEASE:
             if key == glfw.KEY_W:
@@ -1371,6 +1414,7 @@ def main():
     print("  WASD: Move camera")
     print("  Space/Shift: Move up/down")
     print("  Mouse: Look around (click to capture, ESC to release)")
+    print("  F11: Toggle fullscreen")
     print(f"  1-6: Set max LOD level (1=coarse, 6=finest, max={MAX_DEPTH})")
     print("  0: Full detail")
     print("  L: Toggle distance-based LOD")
@@ -1378,6 +1422,7 @@ def main():
     print("  Close window to exit")
     print("Color indicates octree depth (blue=shallow, red=deep)")
     print(f"Distance LOD: {'ON' if use_distance_lod[0] else 'OFF'}, Scale: {lod_distance_scale[0]:.1f}")
+    print(f"Fullscreen: {'ON' if is_fullscreen[0] else 'OFF'} (F11 to toggle)")
     print("Click window to capture mouse...")
     
     # Run the event loop
@@ -1385,4 +1430,15 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="SDF Ray Marching with Octree LOD")
+    parser.add_argument("-f", "--fullscreen", action="store_true", help="Start in fullscreen mode")
+    parser.add_argument("--clear-cache", action="store_true", help="Clear cached volume data")
+    args = parser.parse_args()
+    
+    if args.clear_cache:
+        import shutil
+        if CACHE_DIR.exists():
+            shutil.rmtree(CACHE_DIR)
+            print("Cache cleared")
+    
+    main(fullscreen=args.fullscreen)
