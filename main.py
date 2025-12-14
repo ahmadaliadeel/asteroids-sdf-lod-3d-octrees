@@ -6,7 +6,8 @@ Each octree node has border cells for seamless neighbor sampling.
 
 import numpy as np
 import wgpu
-from rendercanvas.auto import RenderCanvas, loop
+import glfw
+from rendercanvas.glfw import RenderCanvas, loop
 from dataclasses import dataclass
 from typing import Optional
 
@@ -161,18 +162,21 @@ def build_octree(center: np.ndarray, half_size: float) -> list[OctreeNode]:
     
     # Process queue for breadth-first traversal
     queue = [0]  # Start with root index
+    volume_count = [0]
     
     while queue:
         node_idx = queue.pop(0)
         node = nodes[node_idx]
         
+        # Generate volume data for ALL nodes (needed for LOD switching)
+        node.volume_data = generate_node_volume(node)
+        volume_count[0] += 1
+        if volume_count[0] % 10 == 0:
+            print(f"  Generated {volume_count[0]} volumes...")
+        
         if not should_subdivide(node):
-            # Leaf node - generate volume data
+            # Leaf node - no children
             node.is_leaf = True
-            node.volume_data = generate_node_volume(node)
-            leaf_count[0] += 1
-            if leaf_count[0] % 10 == 0:
-                print(f"  Generated {leaf_count[0]} leaf volumes...")
             continue
         
         # Subdivide into 8 children - add them all contiguously
@@ -207,6 +211,10 @@ struct Uniforms {
     resolution: vec2f,
     time: f32,
     num_nodes: u32,
+    max_lod_depth: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
 }
 
 struct OctreeNode {
@@ -256,15 +264,15 @@ fn point_in_node(p: vec3f, node_idx: u32) -> bool {
     return all(d <= vec3f(node.half_size));
 }
 
-// Find the leaf node containing point p
+// Find the leaf node containing point p, respecting LOD limit
 fn find_leaf_node(p: vec3f) -> i32 {
     var current: i32 = 0;
     
     for (var depth = 0u; depth < MAX_DEPTH + 1u; depth++) {
         let node = nodes[current];
         
-        // Check if this is a leaf
-        if (node.children_start < 0) {
+        // Check if this is a leaf OR we've reached LOD limit
+        if (node.children_start < 0 || node.depth >= uniforms.max_lod_depth) {
             return current;
         }
         
@@ -463,14 +471,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
 
 def create_volume_atlas(nodes: list[OctreeNode]) -> tuple[np.ndarray, dict[int, int]]:
     """
-    Create a 3D texture atlas containing all leaf node volumes.
+    Create a 3D texture atlas containing ALL node volumes (for LOD support).
     Returns the atlas data and a mapping from node index to volume index.
     """
-    # Get all leaf nodes
-    leaf_nodes = [n for n in nodes if n.is_leaf and n.volume_data is not None]
-    num_leaves = len(leaf_nodes)
+    # Get all nodes with volume data
+    volume_nodes = [n for n in nodes if n.volume_data is not None]
+    num_volumes = len(volume_nodes)
     
-    print(f"Creating atlas for {num_leaves} leaf nodes")
+    print(f"Creating atlas for {num_volumes} node volumes")
     
     # Arrange volumes in a 3D grid
     volumes_per_side = 8  # 8x8x8 = 512 max volumes
@@ -479,7 +487,7 @@ def create_volume_atlas(nodes: list[OctreeNode]) -> tuple[np.ndarray, dict[int, 
     atlas = np.zeros((atlas_size, atlas_size, atlas_size), dtype=np.float32)
     node_to_volume = {}
     
-    for vol_idx, node in enumerate(leaf_nodes):
+    for vol_idx, node in enumerate(volume_nodes):
         # Calculate position in atlas
         vol_x = vol_idx % volumes_per_side
         vol_y = (vol_idx // volumes_per_side) % volumes_per_side
@@ -506,22 +514,6 @@ def create_node_buffer_data(nodes: list[OctreeNode], node_to_volume: dict[int, i
     Create GPU buffer data for octree nodes.
     Each node: center(vec3f), half_size(f32), children_start(i32), volume_index(i32), depth(u32), pad(u32)
     """
-    # 8 floats per node (32 bytes, properly aligned)
-    data = np.zeros((len(nodes), 8), dtype=np.float32)
-    
-    for node in nodes:
-        i = node.index
-        data[i, 0] = node.center[0]  # center.x
-        data[i, 1] = node.center[1]  # center.y
-        data[i, 2] = node.center[2]  # center.z
-        data[i, 3] = node.half_size   # half_size
-        # Pack integers as float bits
-        data[i, 4] = np.float32(node.children_start if not node.is_leaf else -1).view(np.float32)
-        volume_idx = node_to_volume.get(node.index, -1) if node.is_leaf else -1
-        data[i, 5] = np.float32(volume_idx).view(np.float32)
-        data[i, 6] = np.float32(node.depth).view(np.float32)
-        data[i, 7] = 0.0  # padding
-    
     # Reinterpret as proper types for GPU
     result = np.zeros(len(nodes) * 8, dtype=np.float32)
     for node in nodes:
@@ -534,7 +526,8 @@ def create_node_buffer_data(nodes: list[OctreeNode], node_to_volume: dict[int, i
         # Store integers properly
         int_view = result[base + 4:base + 8].view(np.int32)
         int_view[0] = node.children_start if not node.is_leaf else -1
-        int_view[1] = node_to_volume.get(node.index, -1) if node.is_leaf else -1
+        # ALL nodes now have volume data for LOD support
+        int_view[1] = node_to_volume.get(node.index, -1)
         int_view[2] = node.depth
         int_view[3] = 0
     
@@ -611,12 +604,16 @@ def main():
     )
     device.queue.write_buffer(node_buffer, 0, node_buffer_data.tobytes())
     
-    # Create uniform buffer
-    uniform_data = np.zeros(4, dtype=np.float32)  # resolution(2) + time(1) + num_nodes(1)
+    # Create uniform buffer (8 floats = 32 bytes for alignment)
+    # resolution(2) + time(1) + num_nodes(1) + max_lod_depth(1) + pad(3)
+    uniform_data = np.zeros(8, dtype=np.float32)
     uniform_buffer = device.create_buffer(
         size=uniform_data.nbytes,
         usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
     )
+    
+    # LOD control state
+    current_lod = [MAX_DEPTH]  # Use list for closure mutation
     
     # Create shader module
     shader_module = device.create_shader_module(code=SHADER_CODE)
@@ -690,6 +687,30 @@ def main():
     import time
     start_time = time.perf_counter()
     
+    # Get the GLFW window handle for keyboard input
+    glfw_window = canvas._window
+    
+    def key_callback(window, key, scancode, action, mods):
+        if action == glfw.PRESS or action == glfw.REPEAT:
+            # Number keys 1-4 set LOD level (0-3 depth limit)
+            if key == glfw.KEY_1:
+                current_lod[0] = 0
+                print(f"LOD: 0 (root only)")
+            elif key == glfw.KEY_2:
+                current_lod[0] = 1
+                print(f"LOD: 1")
+            elif key == glfw.KEY_3:
+                current_lod[0] = 2
+                print(f"LOD: 2")
+            elif key == glfw.KEY_4:
+                current_lod[0] = 3
+                print(f"LOD: 3 (max detail)")
+            elif key == glfw.KEY_0:
+                current_lod[0] = MAX_DEPTH
+                print(f"LOD: {MAX_DEPTH} (full detail)")
+    
+    glfw.set_key_callback(glfw_window, key_callback)
+    
     def draw_frame():
         # Update uniforms
         current_time = time.perf_counter() - start_time
@@ -703,10 +724,13 @@ def main():
         uniform_data[0] = float(width)
         uniform_data[1] = float(height)
         uniform_data[2] = current_time
-        # Store num_nodes as uint32
-        uniform_data[3] = np.float32(len(nodes)).view(np.float32)
-        int_view = uniform_data[3:4].view(np.uint32)
+        # Store integers as uint32
+        int_view = uniform_data[3:8].view(np.uint32)
         int_view[0] = len(nodes)
+        int_view[1] = current_lod[0]
+        int_view[2] = 0  # padding
+        int_view[3] = 0  # padding
+        int_view[4] = 0  # padding
         
         device.queue.write_buffer(uniform_buffer, 0, uniform_data.tobytes())
         
@@ -744,7 +768,10 @@ def main():
     canvas.request_draw(draw_frame)
     
     print("Starting render loop...")
-    print("Controls: Close window to exit")
+    print("Controls:")
+    print("  1-4: Set LOD level (1=coarse, 4=fine)")
+    print("  0: Full detail")
+    print("  Close window to exit")
     print("Color indicates octree depth (blue=shallow, red=deep)")
     
     # Run the event loop
