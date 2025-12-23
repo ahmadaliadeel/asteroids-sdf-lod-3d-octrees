@@ -14,9 +14,10 @@ This is a **highly unoptimized but educational** demonstration of several advanc
 - **Distance-Based LOD** — Regions closer to the camera render at higher detail; distant areas use coarser octree nodes
 - **Procedural Generation** — The asteroid surface uses layered FBM (Fractal Brownian Motion) noise for organic, rocky detail
 
-## Screenshots
+## Screenshots + Video
 
 [![](https://img.shields.io/badge/▶️%20Video-Demo-informational)](media/recording.mp4)
+![Screenshot](media/Screenshot%202025-12-23%20203034.png)
 
 > **Watch a demo**: [media/recording.mp4](media/recording.mp4)
 
