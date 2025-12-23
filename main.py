@@ -20,7 +20,7 @@ CACHE_DIR = Path("cache")
 CACHE_VERSION = 1  # Increment when cache format changes
 
 # Volume texture resolution per node (excluding borders)
-VOLUME_SIZE = 40
+VOLUME_SIZE = 32
 # Border size for neighbor sampling (1 cell on each side)
 BORDER_SIZE = 1
 # Total texture size including borders
@@ -650,7 +650,7 @@ fn sample_sdf(p: vec3f) -> f32 {
 
 // Calculate normal from SDF gradient
 fn calc_normal(p: vec3f) -> vec3f {
-    let eps = 0.002;
+    let eps = 0.004;
     let n = vec3f(
         sample_sdf(p + vec3f(eps, 0.0, 0.0)) - sample_sdf(p - vec3f(eps, 0.0, 0.0)),
         sample_sdf(p + vec3f(0.0, eps, 0.0)) - sample_sdf(p - vec3f(0.0, eps, 0.0)),
